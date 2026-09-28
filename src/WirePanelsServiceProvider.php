@@ -5,28 +5,36 @@ declare(strict_types=1);
 namespace NyonCode\WirePanels;
 
 use Illuminate\Routing\Route as RouteDefinition;
+use Illuminate\Routing\Router;
 use Illuminate\Support\Facades\Route;
+use Livewire\Livewire;
 use NyonCode\LaravelPackageToolkit\Packager;
 use NyonCode\LaravelPackageToolkit\PackageServiceProvider;
 use NyonCode\WireCore\Core\Resources\ResourceRegistry;
 use NyonCode\WireCore\Foundation\Registration\Catalog;
 use NyonCode\WireCore\Foundation\Routing\Contracts\AuthorizesUrls;
-use NyonCode\WireCore\Foundation\Routing\Contracts\RegistersPageRoutes;
 use NyonCode\WireCore\Foundation\Routing\Contracts\ResolvesPageUrls;
+use NyonCode\WireCore\Foundation\Routing\RouteGroups;
+use NyonCode\WireCore\Foundation\Routing\WireRoutes;
 use NyonCode\WireCore\Foundation\Setup\SetupRegistry;
-use NyonCode\WirePanels\Exceptions\ResourceRoutingException;
+use NyonCode\WireCore\Foundation\View\PageChrome;
+use NyonCode\WirePanels\Http\Middleware\IdentifyTenant;
+use NyonCode\WirePanels\Http\Middleware\RememberPage;
 use NyonCode\WirePanels\Install\RegisterResourceRoutes;
 use NyonCode\WirePanels\Pages\PageRegistry;
 use NyonCode\WirePanels\Resources\Console\ListResourcesCommand;
+use NyonCode\WirePanels\Resources\Console\MakeClusterCommand;
 use NyonCode\WirePanels\Resources\Console\MakeDashboardPageCommand;
 use NyonCode\WirePanels\Resources\Console\MakePageCommand;
 use NyonCode\WirePanels\Resources\Console\MakeRelationManagerCommand;
 use NyonCode\WirePanels\Resources\Console\MakeResourceCommand;
-use NyonCode\WirePanels\Routing\ConfiguredRoutes;
+use NyonCode\WirePanels\Routing\PanelRoutes;
 use NyonCode\WirePanels\Routing\RegisteredPageUrls;
 use NyonCode\WirePanels\Routing\ResourceRoutes;
 use NyonCode\WirePanels\Routing\RouteAccess;
 use NyonCode\WirePanels\Routing\RouteClaims;
+use NyonCode\WirePanels\Routing\TenantEntryRoutes;
+use NyonCode\WirePanels\Routing\ZoneEntryRoutes;
 
 /**
  * The application owner layer.
@@ -68,13 +76,6 @@ class WirePanelsServiceProvider extends PackageServiceProvider
                 // writes onto those routes, asked of the Gate.
                 $this->app->bind(AuthorizesUrls::class, RouteAccess::class);
 
-                // And core calls this once the registries are full, which is the
-                // only moment auto-registration can read a complete catalogue.
-                // Bound during register() so it is there before core boots,
-                // rather than depending on which provider the manifest lists
-                // first — see ConfiguredRoutes.
-                $this->app->bind(RegistersPageRoutes::class, ConfiguredRoutes::class);
-
                 // The application's own pages join the catalogue as a third
                 // source, so the router, the menu and wire:resources read them
                 // the way they read resources — nothing of theirs learns a page
@@ -88,6 +89,17 @@ class WirePanelsServiceProvider extends PackageServiceProvider
                 SetupRegistry::instance()->register(RegisterResourceRoutes::class);
             })
             ->bootedPackage(function (): void {
+                // The tenant zone's middleware, by alias for route files and
+                // persistent for Livewire: a round trip is a request to
+                // `livewire/update`, and without this the tenant — and every
+                // link it fills in — would be gone on the second render.
+                $this->app->make(Router::class)->aliasMiddleware(IdentifyTenant::ALIAS, IdentifyTenant::class);
+                Livewire::addPersistentMiddleware([IdentifyTenant::class, RememberPage::class]);
+
+                // The company switcher, in whatever shell draws the top bar. It
+                // renders nothing outside a tenant zone.
+                $this->app->make(PageChrome::class)->add('wire-panels::tenancy.switcher', PageChrome::TOPBAR, sort: -10);
+
                 // Once every route is loaded: a route file registers its
                 // routes from a provider's booted callback, and the one that
                 // replaces a page may come after the page.
@@ -106,6 +118,7 @@ class WirePanelsServiceProvider extends PackageServiceProvider
             // dashboard page's, under one tag.
             ->hasCommand(MakeResourceCommand::class)
             ->hasCommand(MakePageCommand::class)
+            ->hasCommand(MakeClusterCommand::class)
             ->hasCommand(MakeRelationManagerCommand::class)
             ->hasCommand(ListResourcesCommand::class)
             ->hasStubs([
@@ -113,6 +126,7 @@ class WirePanelsServiceProvider extends PackageServiceProvider
                 '../stubs/resource.stub',
                 '../stubs/resource-page.stub',
                 '../stubs/page.stub',
+                '../stubs/cluster.stub',
                 '../stubs/page-view.stub',
                 '../stubs/relation-manager.stub',
             ])
@@ -132,23 +146,17 @@ class WirePanelsServiceProvider extends PackageServiceProvider
      */
     protected function registerRouteMacros(): void
     {
-        Route::macro('wireResources', function (array $only = [], array $except = []): array {
-            // Both paths at once registers every page twice under one route
-            // name. Refused rather than resolved — see the exception for why.
-            if (app()->bound(ConfiguredRoutes::MARKER)) {
-                throw ResourceRoutingException::alreadyRegisteredFromConfig();
-            }
+        // The panel's groups, placed by the application: `Route::wire('panel')`
+        // in its route file, or an entry of `wire-core.routes.groups` (ADR 0041).
+        RouteGroups::instance()->register(PanelRoutes::class, ZoneEntryRoutes::class, TenantEntryRoutes::class);
 
-            return ResourceRoutes::all($only, $except);
-        });
+        // The names this package shipped before `Route::wire()`, kept as what
+        // they always were — the same group, the same registration.
+        Route::macro('wireResources', fn (array $only = [], array $except = []): array => app(WireRoutes::class)->wire('panel', ['only' => $only, 'except' => $except]));
 
-        Route::macro('wireResource', function (string $resource, array $pages = []): array {
-            return ResourceRoutes::for($resource, $pages);
-        });
+        Route::macro('wireResource', fn (string $resource, array $pages = []): array => app(WireRoutes::class)->wire('panel', ['resource' => $resource, 'pages' => $pages]));
 
-        Route::macro('wireZoneEntry', function (string $uri = '/'): RouteDefinition {
-            return ResourceRoutes::zoneEntry($uri);
-        });
+        Route::macro('wireZoneEntry', fn (string $uri = '/'): RouteDefinition => app(WireRoutes::class)->wire('zones', ['uri' => $uri])['entry']);
     }
 
     /**

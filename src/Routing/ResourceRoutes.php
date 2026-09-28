@@ -10,9 +10,14 @@ use Illuminate\Support\Facades\Route as RouteFacade;
 use NyonCode\WireCore\Foundation\Registration\Catalog;
 use NyonCode\WireCore\Foundation\Routing\Contracts\ConfiguresRoutes;
 use NyonCode\WireCore\Foundation\Routing\Contracts\ProvidesPages;
+use NyonCode\WireCore\Foundation\Routing\Contracts\RequiresTenant;
 use NyonCode\WireCore\Foundation\Routing\RoutePage;
 use NyonCode\WireCore\Foundation\Routing\Zone;
+use NyonCode\WirePanels\Clusters\Cluster;
+use NyonCode\WirePanels\Clusters\ClusterNavigation;
 use NyonCode\WirePanels\Exceptions\ResourceRoutingException;
+use NyonCode\WirePanels\Http\Middleware\IdentifyTenant;
+use NyonCode\WirePanels\Http\Middleware\RememberPage;
 use NyonCode\WirePanels\Resources\Contracts\NestedResource;
 
 /**
@@ -96,6 +101,13 @@ final class ResourceRoutes
                 continue;
             }
 
+            // A page that only exists inside a company, in a group with no
+            // company in it, would be an address that only ever answers 404 —
+            // and an application without tenancy would carry it for nothing.
+            if (is_subclass_of($class, RequiresTenant::class) && ! self::groupHasTenant()) {
+                continue;
+            }
+
             $prefix = self::prefixFor($class, $key);
 
             // A landing page — `routePrefix()` of `ConfiguresRoutes::ROOT` — sits
@@ -160,6 +172,26 @@ final class ResourceRoutes
     public static function zoneEntry(string $uri = '/'): Route
     {
         return RouteFacade::get($uri, ZoneEntry::class)->name('wire.zones');
+    }
+
+    /**
+     * A tenant zone's bare address: to the person's default tenant, or to
+     * `routes.tenant_entry.view` when they have none (ADR 0040 §7).
+     *
+     * @param  string  $uri  Where it answers — the zone's prefix without the tenant.
+     * @param  string  $to  The tenant's address, with `{tenant}` where its key goes: `app/{tenant}`, `//{tenant}.example.com`.
+     */
+    public static function tenantEntry(string $uri, string $to): Route
+    {
+        return RouteFacade::get($uri, TenantEntry::class)
+            ->defaults(TenantEntry::TARGET, $to)
+            ->name('wire.tenants');
+    }
+
+    /** Whether the group this is registered inside carries `{tenant}`, in its prefix or its domain. */
+    private static function groupHasTenant(): bool
+    {
+        return str_contains(self::groupPrefix().' '.self::groupDomain(), '{'.IdentifyTenant::PARAMETER.'}');
     }
 
     private static function groupDomain(): ?string
@@ -230,7 +262,9 @@ final class ResourceRoutes
             // it was given, so setting the resource's and then the page's left
             // only the page's — and a resource-wide `auth` silently disappeared
             // from every page that added one of its own.
-            $registrar = RouteFacade::middleware([...$shared, ...$page->getMiddleware()]);
+            // RememberPage on every page, so a Livewire round trip knows which
+            // page — and so which zone — it is working on (ADR 0027's trap).
+            $registrar = RouteFacade::middleware([RememberPage::class, ...$shared, ...$page->getMiddleware()]);
 
             if ($domain !== null) {
                 $registrar = $registrar->domain($domain);
@@ -355,7 +389,11 @@ final class ResourceRoutes
             : $key;
 
         if (! is_subclass_of($resource, NestedResource::class)) {
-            return $own;
+            // Inside a cluster: settings/currencies. The route *name* stays
+            // `wire.{key}.{page}`, so every link built by key follows the move.
+            $cluster = self::clusterOf($resource);
+
+            return $cluster === null ? $own : trim(self::prefixFor($cluster, $cluster::key()).'/'.$own, '/');
         }
 
         // Under one record of the parent: orders/{parent}/order-lines. One level,
@@ -382,9 +420,33 @@ final class ResourceRoutes
 
         // A nested resource sits inside its parent's pages, so whatever guards
         // those guards it too — a line of an order nobody may see stays unseen.
-        return is_subclass_of($resource, NestedResource::class)
-            ? [...self::middlewareFor($resource::parentResource()), ...$own]
-            : $own;
+        if (is_subclass_of($resource, NestedResource::class)) {
+            return [...self::middlewareFor($resource::parentResource()), ...$own];
+        }
+
+        // And a cluster's member inside the cluster, by the same rule: a section
+        // someone may not enter is not enterable through a bookmark either.
+        $cluster = self::clusterOf($resource);
+
+        if ($cluster === null) {
+            return $own;
+        }
+
+        return [...$cluster::pages()['index']->getMiddleware(), ...$own];
+    }
+
+    /**
+     * The cluster a class is routed inside, or null — refusing one it cannot be in.
+     *
+     * Asked of {@see ClusterNavigation}, the one owner of membership, so the
+     * prefix a member is routed under and the tabs its page draws agree.
+     *
+     * @param  class-string  $class
+     * @return class-string<Cluster>|null
+     */
+    private static function clusterOf(string $class): ?string
+    {
+        return app(ClusterNavigation::class)->clusterOf($class);
     }
 
     /**
